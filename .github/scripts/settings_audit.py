@@ -39,6 +39,41 @@ def validate(value, fields, path):
             raise ValueError(path + '.' + key + ': invalid value/type')
 
 
+def validate_nested(rules):
+    # Limited comparison schema, not an exhaustive GitHub apply-payload validator.
+    ref = rules.get('conditions', {}).get('ref_name', MISSING)
+    if ref is not MISSING:
+        if not isinstance(ref, dict):
+            raise ValueError('conditions.ref_name must be an object')
+        for key in ('include', 'exclude'):
+            if key in ref and (not isinstance(ref[key], list) or any(type(v) is not str for v in ref[key])):
+                raise ValueError('conditions.ref_name.' + key + ' must be a string array')
+    booleans = {'dismiss_stale_reviews_on_push', 'require_code_owner_review',
+                'require_last_push_approval', 'required_review_thread_resolution',
+                'strict_required_status_checks_policy', 'do_not_enforce_on_create',
+                'automatic_copilot_code_review_enabled', 'update', 'non_fast_forward'}
+    for rule in rules.get('rules', []):
+        validate(rule, {'type': str, 'parameters': dict}, 'ruleset.rules')
+        params = rule.get('parameters', {})
+        for key in booleans & params.keys():
+            if type(params[key]) is not bool:
+                raise ValueError('parameters.' + key + ' must be boolean')
+        if 'required_approving_review_count' in params:
+            count = params['required_approving_review_count']
+            if type(count) is not int or count < 0:
+                raise ValueError('required_approving_review_count must be a nonnegative integer')
+        if 'required_status_checks' in params:
+            checks = params['required_status_checks']
+            if not isinstance(checks, list):
+                raise ValueError('required_status_checks must be an array')
+            for check in checks:
+                if not isinstance(check, dict) or type(check.get('context')) is not str:
+                    raise ValueError('required_status_checks entry requires string context')
+                integration = check.get('integration_id')
+                if integration is not None and (type(integration) is not int or integration <= 0):
+                    raise ValueError('integration_id must be positive integer or null')
+
+
 def gh(host: str, *args: str, raw: bool = False) -> Any:
     try:
         proc = subprocess.run(['gh', *args], capture_output=True, text=True, timeout=60)
@@ -61,35 +96,54 @@ def compare(wanted, actual, path, findings):
         findings.append({'path':path,'status':'unknown','expected':wanted})
     elif isinstance(wanted, dict):
         if not isinstance(actual, dict):
-            findings.append({'path':path,'status':'unknown','reason':'response shape'})
+            findings.append({'path':path,'status':'drift','expected':wanted,'actual':actual,'reason':'response type differs'})
         else:
             for key, value in wanted.items():
                 compare(value, actual.get(key, MISSING), path + '.' + key, findings)
     elif isinstance(wanted, list):
         if not isinstance(actual, list):
-            findings.append({'path':path,'status':'unknown','reason':'response shape'})
+            findings.append({'path':path,'status':'drift','expected':wanted,'actual':actual,'reason':'response type differs'})
             return
-        # Maximum one-to-one projected matching for unordered multisets.
-        def matches(value, item):
-            probe = []
-            compare(value, item, path, probe)
-            return all(f['status'] == 'match' for f in probe)
-        edges = [[i for i, item in enumerate(actual) if matches(value, item)] for value in wanted]
+        # Small evidence arrays: exact edges first, then non-drift potential edges.
+        probes = []
+        for index, value in enumerate(wanted):
+            row = []
+            for item in actual:
+                probe = []
+                compare(value, item, f'{path}[{index}]', probe)
+                row.append(probe)
+            probes.append(row)
+        exact = [[i for i, probe in enumerate(row) if all(f['status'] == 'match' for f in probe)] for row in probes]
+        potential = [[i for i, probe in enumerate(row) if not any(f['status'] == 'drift' for f in probe)] for row in probes]
         assigned = {}
-        def assign(index, seen):
+        def assign(index, seen, edges):
             for candidate in edges[index]:
                 if candidate in seen:
                     continue
                 seen.add(candidate)
-                if candidate not in assigned or assign(assigned[candidate], seen):
+                if candidate not in assigned or assign(assigned[candidate], seen, edges):
                     assigned[candidate] = index
                     return True
             return False
+        for index in range(len(wanted)):
+            assign(index, set(), exact)
+        for index in range(len(wanted)):
+            if index not in assigned.values():
+                assign(index, set(), potential)
         for index, value in enumerate(wanted):
-            if not assign(index, set()):
+            if index in assigned.values():
+                continue
+            for candidate, item in enumerate(actual):
+                if candidate in assigned or not isinstance(value, dict) or not isinstance(item, dict):
+                    continue
+                identity = next((key for key in ('type', 'context', 'actor_type') if key in value), None)
+                if identity is not None and type(item.get(identity)) is type(value[identity]) and item.get(identity) == value[identity]:
+                    assigned[candidate] = index
+                    break
+            else:
                 findings.append({'path':f'{path}[{index}]','status':'drift','expected':value,'reason':'missing matching array entry'})
         for candidate, index in sorted(assigned.items(), key=lambda entry: entry[1]):
-            compare(wanted[index], actual[candidate], f'{path}[{index}]', findings)
+            findings.extend(probes[index][candidate])
         remaining = [item for index, item in enumerate(actual) if index not in assigned]
         if remaining:
             findings.append({'path':path,'status':'drift','actual_extra':remaining})
@@ -110,6 +164,8 @@ def main():
     findings = []
     preflight = {'status':'not collected'}
     collected = False
+    rules_collected = False
+    rules_compared = False
     try:
         if not re.fullmatch(r'[A-Za-z0-9]+(?:[.-][A-Za-z0-9]+)*', args.host) or not re.fullmatch(r'[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?/[A-Za-z0-9_.-]+', args.repo) or args.repo.split('/')[-1] in ('.','..'):
             raise ValueError('host/repo format invalid; use HOST and OWNER/REPO separately')
@@ -123,13 +179,16 @@ def main():
             raise ValueError('settings must declare at least one supported field')
         for section, fields in [('rest', REST), ('graphql', GRAPHQL)]:
             validate(wanted.get(section, {}), fields, section)
-        rules = load(args.ruleset) if args.ruleset and not args.preflight else None
-        if rules is not None:
+        rules = load(args.ruleset) if args.ruleset else None
+        if args.ruleset:
+            if not isinstance(rules, dict):
+                raise ValueError('ruleset must be a non-null object')
             validate(rules, RULE_FIELDS, 'ruleset')
             if not rules.get('name') or rules.get('target') not in ('branch','tag'):
                 raise ValueError('ruleset requires name and branch/tag target')
             if 'enforcement' in rules and rules['enforcement'] not in ('active','disabled','evaluate'):
                 raise ValueError('ruleset enforcement invalid')
+            validate_nested(rules)
             for rule in rules.get('rules', []):
                 validate(rule, {'type':str,'parameters':dict}, 'ruleset.rules')
                 if not rule.get('type'):
@@ -141,6 +200,8 @@ def main():
                     raise ValueError('unsupported bypass actor type/mode')
                 if not (actor['actor_type'] == 'OrganizationAdmin' and actor['actor_id'] is None) and (type(actor['actor_id']) is not int or actor['actor_id'] <= 0):
                     raise ValueError('bypass actor_id must be a positive integer or null for OrganizationAdmin')
+        if args.preflight:
+            rules = None
         gh(args.host, 'auth','status','--hostname',args.host, raw=True)
         view = gh(args.host,'repo','view',args.host+'/'+args.repo,'--json','nameWithOwner,defaultBranchRef')
         actual = gh(args.host,'api','--hostname',args.host,'--method','GET','repos/'+args.repo)
@@ -157,6 +218,8 @@ def main():
                 if not isinstance(response,dict) or not isinstance(response.get('data'),dict):
                     raise Unknown('invalid GraphQL response shape')
                 data = response['data']
+                if data.get('repository') is not None and not isinstance(data.get('repository'), dict):
+                    raise Unknown('invalid GraphQL repository response shape')
                 compare(wanted['graphql'],data.get('repository'), 'graphql',findings)
                 if response.get('errors'):
                     findings.append({'path':'graphql','status':'unknown','reason':'GraphQL errors; check schema/permissions'})
@@ -165,6 +228,9 @@ def main():
         if rules is not None:
             try:
                 pages = gh(args.host,'api','--hostname',args.host,'--method','GET','repos/'+args.repo+'/rulesets?includes_parents=true&per_page=100','--paginate','--slurp')
+                if not isinstance(pages, list) or any(not isinstance(page, list) or any(not isinstance(entry, dict) for entry in page) for page in pages):
+                    raise Unknown('invalid ruleset list response shape')
+                rules_collected = True
                 matches = [r for page in pages for r in page if r.get('name') == rules['name'] and r.get('target') == rules['target']]
                 if len(matches) > 1:
                     raise Unknown('ambiguous matching rulesets; inspect repository and inherited policy')
@@ -172,11 +238,14 @@ def main():
                     findings.append({'path':'ruleset','status':'drift','reason':'no matching name + target'})
                 else:
                     detail = gh(args.host,'api','--hostname',args.host,'--method','GET',f"repos/{args.repo}/rulesets/{matches[0]['id']}")
+                    if detail is not None and not isinstance(detail, dict):
+                        raise Unknown('invalid ruleset detail response shape')
                     selected = dict(rules)
                     if 'bypass_actors' in selected and not args.compare_bypass:
                         selected.pop('bypass_actors')
                         findings.append({'path':'ruleset.bypass_actors','status':'excluded' if args.scope == 'ci' else 'unknown','reason':'EXCLUDED from CI comparison; UNVERIFIED admin policy' if args.scope == 'ci' else 'comparison opt-in requires independently verified admin visibility'})
                     compare(selected,detail,'ruleset',findings)
+                    rules_compared = True
             except (Unknown, KeyError, TypeError) as error:
                 findings.append({'path':'ruleset','status':'unknown','reason':str(error) if isinstance(error,Unknown) else 'invalid ruleset API response'})
         status = 'unknown' if any(f['status']=='unknown' for f in findings) else 'drift' if any(f['status']=='drift' for f in findings) else 'match'
@@ -189,7 +258,7 @@ def main():
         findings.append({'path':'collection','status':status,'reason':str(error) if isinstance(error,Unknown) else 'invalid API response shape'})
     coverage = {
         'settings':'collected; declared fields only' if collected else 'not collected; preflight only' if args.preflight and preflight['status'] == 'verified' else 'not collected',
-        'ruleset':'selected; declaration comparison only, not effective enforcement' if collected and args.ruleset else 'not collected; no protection compliance claim',
+        'ruleset':'selected; declaration comparison only, not effective enforcement' if rules_compared else 'list collected; selected policy comparison incomplete; no enforcement claim' if rules_collected else 'not collected; no protection compliance claim',
         'bypass':'EXCLUDED from CI; UNVERIFIED; authoritative desired policy unchanged' if args.scope == 'ci' else 'opt-in; admin-visible declared actors only' if args.compare_bypass else 'not compared; admin visibility not guaranteed',
         'full_policy_verified':False,
         'identity':'current gh credential; operator and CI coverage differ',
