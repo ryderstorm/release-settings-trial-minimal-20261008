@@ -173,9 +173,9 @@ def main():
             raise ValueError('--settings required unless --preflight is selected')
         if args.scope == 'ci' and args.compare_bypass:
             raise ValueError('--compare-bypass is operator-only; CI exclusion cannot verify bypass')
-        wanted = {} if args.preflight else load(args.settings)
+        wanted = load(args.settings) if args.settings else {}
         validate(wanted, {'rest':dict,'graphql':dict}, 'settings')
-        if not args.preflight and (not wanted or not any(wanted.values())):
+        if args.settings and (not wanted or not any(wanted.values())):
             raise ValueError('settings must declare at least one supported field')
         for section, fields in [('rest', REST), ('graphql', GRAPHQL)]:
             validate(wanted.get(section, {}), fields, section)
@@ -196,12 +196,18 @@ def main():
             for actor in rules.get('bypass_actors', []):
                 if not isinstance(actor,dict) or set(actor) != {'actor_id','actor_type','bypass_mode'}:
                     raise ValueError('bypass actor requires exactly actor_id, actor_type, bypass_mode')
-                if actor['actor_type'] not in ('OrganizationAdmin','RepositoryRole','Team','Integration','DeployKey') or actor['bypass_mode'] not in ('always','pull_request','exempt'):
+                if actor['actor_type'] not in ('OrganizationAdmin','RepositoryRole','Team','Integration','DeployKey','User') or actor['bypass_mode'] not in ('always','pull_request','exempt'):
                     raise ValueError('unsupported bypass actor type/mode')
-                if not (actor['actor_type'] == 'OrganizationAdmin' and actor['actor_id'] is None) and (type(actor['actor_id']) is not int or actor['actor_id'] <= 0):
-                    raise ValueError('bypass actor_id must be a positive integer or null for OrganizationAdmin')
+                if actor['actor_type'] == 'DeployKey':
+                    if actor['actor_id'] is not None or actor['bypass_mode'] == 'pull_request':
+                        raise ValueError('DeployKey requires null actor_id and no pull_request mode')
+                elif not (actor['actor_type'] == 'OrganizationAdmin' and actor['actor_id'] is None) and (type(actor['actor_id']) is not int or actor['actor_id'] <= 0):
+                    raise ValueError('bypass actor_id must be positive, or null for OrganizationAdmin/DeployKey')
+                if actor['bypass_mode'] == 'pull_request' and rules['target'] != 'branch':
+                    raise ValueError('pull_request bypass mode requires a branch ruleset')
         if args.preflight:
             rules = None
+            wanted = {}
         gh(args.host, 'auth','status','--hostname',args.host, raw=True)
         view = gh(args.host,'repo','view',args.host+'/'+args.repo,'--json','nameWithOwner,defaultBranchRef')
         actual = gh(args.host,'api','--hostname',args.host,'--method','GET','repos/'+args.repo)
@@ -230,6 +236,8 @@ def main():
                 pages = gh(args.host,'api','--hostname',args.host,'--method','GET','repos/'+args.repo+'/rulesets?includes_parents=true&per_page=100','--paginate','--slurp')
                 if not isinstance(pages, list) or any(not isinstance(page, list) or any(not isinstance(entry, dict) for entry in page) for page in pages):
                     raise Unknown('invalid ruleset list response shape')
+                if any(type(entry.get('id')) is not int or entry['id'] <= 0 or not isinstance(entry.get('name'), str) or not entry['name'] or entry.get('target') not in ('branch','tag','push') for page in pages for entry in page):
+                    raise Unknown('incomplete ruleset list identities; cannot conclude policy absence')
                 rules_collected = True
                 matches = [r for page in pages for r in page if r.get('name') == rules['name'] and r.get('target') == rules['target']]
                 if len(matches) > 1:
