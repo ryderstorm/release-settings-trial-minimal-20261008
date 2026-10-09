@@ -1,0 +1,177 @@
+name: CI and Release
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  settings:
+    name: Settings Audit
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+      - name: Compare repository-owned ruleset
+        # Bypass and inherited policy require a separate administrator audit.
+        run: |
+          python3 - <<'PY'
+          import difflib
+          import json
+          import os
+          import subprocess
+          import sys
+
+          def api(*args):
+              return json.loads(subprocess.check_output(['gh', 'api', *args], text=True))
+
+          def nonnull(value):
+              if value is None:
+                  sys.exit('Null ruleset declarations are not supported')
+              if isinstance(value, dict):
+                  for item in value.values():
+                      nonnull(item)
+              if isinstance(value, list):
+                  for item in value:
+                      nonnull(item)
+
+          def project(live, desired):
+              if isinstance(desired, dict):
+                  if not isinstance(live, dict):
+                      return live
+                  return {key: project(live.get(key), value) for key, value in desired.items()}
+              if isinstance(desired, list):
+                  if not isinstance(live, list):
+                      return live
+                  if desired and isinstance(desired[0], dict):
+                      if 'type' in desired[0]:
+                          specs = {item['type']: item for item in desired}
+                          live = [project(item, specs.get(item.get('type'), {'type': item.get('type')}))
+                                  if isinstance(item, dict) else item for item in live]
+                      else:
+                          live = [project(item, desired[0]) for item in live]
+                  return sorted(live, key=lambda item: json.dumps(item, sort_keys=True))
+              return live
+
+          with open('.github/ruleset-config.json') as config:
+              desired = json.load(config)
+          if not isinstance(desired, dict) or not desired:
+              sys.exit('Ruleset declaration must be a nonempty object')
+          if not isinstance(desired.get('name'), str) or not desired['name'].strip():
+              sys.exit('Ruleset name must be a nonempty string')
+          if desired.get('target') not in ('branch', 'tag'):
+              sys.exit('Ruleset target must be branch or tag')
+          desired.pop('bypass_actors', None)
+          nonnull(desired)
+          print('BYPASS ACTORS EXCLUDED: an empty/redacted read-token response proves nothing; audit as admin.')
+          endpoint = f"repos/{os.environ['GITHUB_REPOSITORY']}/rulesets"
+          pages = api('--paginate', '--slurp', f'{endpoint}?includes_parents=false&per_page=100')
+          matches = [item for page in pages for item in page
+                     if item['name'] == desired['name'] and item['target'] == desired['target']]
+          if len(matches) != 1:
+              sys.exit(f'Expected exactly one repository-owned ruleset; found {len(matches)}')
+          wanted = project(desired, desired)
+          actual = project(api(f"{endpoint}/{matches[0]['id']}"), desired)
+          if json.dumps(wanted, sort_keys=True) != json.dumps(actual, sort_keys=True):
+              print('\n'.join(difflib.unified_diff(
+                  json.dumps(wanted, indent=2, sort_keys=True).splitlines(),
+                  json.dumps(actual, indent=2, sort_keys=True).splitlines(),
+                  fromfile='committed ruleset', tofile='GitHub ruleset', lineterm='')))
+              sys.exit('Ruleset differs or a declared field is missing/null')
+          print('Declared ruleset fields match; bypass and inherited policy remain unverified.')
+          PY
+      - name: Compare selected General settings
+        # Merge policy may be absent from read-only REST; use GraphQL.
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+          import sys
+
+          def api(*args):
+              return json.loads(subprocess.check_output(['gh', 'api', *args], text=True))
+
+          rest_bools = {'has_issues', 'has_projects', 'has_wiki', 'has_discussions',
+                        'is_template', 'web_commit_signoff_required', 'allow_forking'}
+          graphql_bools = {'mergeCommitAllowed', 'squashMergeAllowed', 'rebaseMergeAllowed',
+                           'autoMergeAllowed', 'allowUpdateBranch', 'deleteBranchOnMerge',
+                           'hasSponsorshipsEnabled'}
+          enums = {'squashMergeCommitTitle': {'PR_TITLE', 'COMMIT_OR_PR_TITLE'},
+                   'squashMergeCommitMessage': {'PR_BODY', 'COMMIT_MESSAGES', 'BLANK'},
+                   'mergeCommitTitle': {'PR_TITLE', 'MERGE_MESSAGE'},
+                   'mergeCommitMessage': {'PR_BODY', 'PR_TITLE', 'BLANK'},
+                   'issueCreationPolicy': {'ALL', 'COLLABORATORS_ONLY'},
+                   'pullRequestCreationPolicy': {'ALL', 'COLLABORATORS_ONLY'}}
+          with open('.github/repository-settings.json') as config:
+              desired = json.load(config)
+          if not isinstance(desired, dict) or not desired or set(desired) - {'rest', 'graphql'}:
+              sys.exit('Settings must be a nonempty rest/graphql object')
+          for source, fields in desired.items():
+              if not isinstance(fields, dict) or not fields:
+                  sys.exit(f'{source} must be a nonempty object')
+              for key, value in fields.items():
+                  valid = (source == 'rest' and key == 'default_branch'
+                           and isinstance(value, str) and bool(value.strip()))
+                  if key in (rest_bools if source == 'rest' else graphql_bools):
+                      valid = type(value) is bool
+                  if source == 'graphql' and key in enums:
+                      valid = isinstance(value, str) and value in enums[key]
+                  if not valid:
+                      sys.exit(f'Unsupported or invalid declaration: {source}.{key}')
+          owner, name = os.environ['GITHUB_REPOSITORY'].split('/')
+          sources = {}
+          if 'rest' in desired:
+              sources['rest'] = api(f'repos/{owner}/{name}')
+          if 'graphql' in desired:
+              selection = ' '.join(desired['graphql'])
+              query = ('query($owner:String!,$name:String!){repository(owner:$owner,name:$name){'
+                       + selection + '}}')
+              response = api('graphql', '-f', f'query={query}', '-f', f'owner={owner}', '-f', f'name={name}')
+              if response.get('errors') or not isinstance(response.get('data', {}).get('repository'), dict):
+                  sys.exit('GraphQL repository read failed or is missing/null')
+              sources['graphql'] = response['data']['repository']
+          drift = [(f'{source}.{key}', expected, sources[source].get(key, '<missing>'))
+                   for source, fields in desired.items() for key, expected in fields.items()
+                   if type(sources[source].get(key)) is not type(expected) or sources[source].get(key) != expected]
+          for field, expected, actual in drift:
+              print(f'{field}: committed={expected!r}, GitHub={actual!r}')
+          if drift:
+              sys.exit('Selected settings differ or a declared field is missing/null')
+          print('Declared General settings match; no settings were changed.')
+          PY
+
+  release:
+    name: Semantic release
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [settings]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    concurrency:
+      group: semantic-release-main
+      cancel-in-progress: false
+    steps:
+      - uses: octo-sts/action@f603d3be9d8dd9871a265776e625a27b00effe05 # v1.1.1
+        id: octo-sts
+        with:
+          scope: ${{ github.repository }}
+          identity: main-semantic-release
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        with:
+          fetch-depth: 0
+          token: ${{ steps.octo-sts.outputs.token }}
+      - uses: python-semantic-release/python-semantic-release@9a026e9303981c866c3425723009becb2437c757 # v10.6.2
+        with:
+          config_file: .releaserc.toml
+          github_token: ${{ steps.octo-sts.outputs.token }}
+          build: false
+          push: true
+          vcs_release: true

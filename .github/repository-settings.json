@@ -8,6 +8,8 @@
     "mergeCommitAllowed": false,
     "squashMergeAllowed": true,
     "rebaseMergeAllowed": false,
-    "deleteBranchOnMerge": true
+    "deleteBranchOnMerge": true,
+    "squashMergeCommitTitle": "PR_TITLE",
+    "squashMergeCommitMessage": "PR_BODY"
   }
 }
