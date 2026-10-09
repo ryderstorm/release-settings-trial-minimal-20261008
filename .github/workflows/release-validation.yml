@@ -1,0 +1,35 @@
+# Adapt main to the inspected release branch; preserve existing CI prerequisites.
+# Safe validation template: even activation never publishes. Production is a separate approval.
+name: Semantic Release Validation
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+concurrency:
+  group: semantic-release-validation-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  validate:
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'workflow_dispatch' || vars.SEMANTIC_RELEASE_ENABLED == 'true')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+      - name: No-operation semantic release
+        uses: python-semantic-release/python-semantic-release@9a026e9303981c866c3425723009becb2437c757 # v10.6.2
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          config_file: .releaserc.toml
+          no_operation_mode: true
+          build: false
+          push: false
+          vcs_release: false

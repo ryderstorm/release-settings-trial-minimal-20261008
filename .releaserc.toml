@@ -1,0 +1,16 @@
+[semantic_release]
+tag_format = "v{version}"
+allow_zero_version = true
+major_on_zero = false
+version_variables = []
+commit_message = "chore(release): {version} [skip ci]"
+
+[semantic_release.branches.main]
+match = "main"
+
+[semantic_release.changelog.default_templates]
+changelog_file = "CHANGELOG.md"
+output_format = "md"
+
+[semantic_release.remote]
+token = { env = "GH_TOKEN" }

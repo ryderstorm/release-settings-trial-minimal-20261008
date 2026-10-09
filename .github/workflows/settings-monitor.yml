@@ -1,0 +1,33 @@
+# Copy scripts/settings_audit.py to .github/scripts/settings_audit.py.
+# Adapt main to the exact default branch. No app-specific checks are introduced.
+name: Repository Settings
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  settings-audit:
+    name: Settings Audit
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Compare declared settings
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_HOST: ${{ github.server_url == 'https://github.com' && 'github.com' || '' }}
+          TARGET_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=(--host "$GH_HOST" --repo "$TARGET_REPO" --settings .github/repository-settings.json)
+          if [[ -f .github/ruleset-config.json ]]; then
+            args+=(--ruleset .github/ruleset-config.json)
+          fi
+          python3 .github/scripts/settings_audit.py "${args[@]}"
