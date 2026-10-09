@@ -21,12 +21,14 @@ jobs:
       - name: Compare declared settings
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GH_HOST: ${{ github.server_url == 'https://github.com' && 'github.com' || '' }}
+          GH_SERVER_URL: ${{ github.server_url }}
           TARGET_REPO: ${{ github.repository }}
         shell: bash
         run: |
           set -euo pipefail
-          args=(--host "$GH_HOST" --repo "$TARGET_REPO" --settings .github/repository-settings.json)
+          GH_HOST="$(python3 -c 'import os, urllib.parse; u=urllib.parse.urlsplit(os.environ["GH_SERVER_URL"]); assert u.scheme == "https" and u.hostname and not u.username and not u.password and not u.port and u.path in ("", "/") and not u.query and not u.fragment; print(u.hostname)')"
+          export GH_HOST
+          args=(--scope ci --host "$GH_HOST" --repo "$TARGET_REPO" --settings .github/repository-settings.json)
           if [[ -f .github/ruleset-config.json ]]; then
             args+=(--ruleset .github/ruleset-config.json)
           fi

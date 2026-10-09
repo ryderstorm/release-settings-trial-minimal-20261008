@@ -6,7 +6,7 @@ version_variables = []
 commit_message = "chore(release): {version} [skip ci]"
 
 [semantic_release.branches.main]
-match = "main"
+match = "^main$"
 
 [semantic_release.changelog.default_templates]
 changelog_file = "CHANGELOG.md"

@@ -5,12 +5,14 @@ import json
 import re
 import subprocess
 import sys
+from typing import Any
 
-REST = dict.fromkeys('has_issues has_projects has_wiki has_discussions is_template web_commit_signoff_required allow_forking'.split(), bool)
-GRAPHQL = dict.fromkeys('mergeCommitAllowed squashMergeAllowed rebaseMergeAllowed autoMergeAllowed allowUpdateBranch deleteBranchOnMerge hasSponsorshipsEnabled'.split(), bool)
+REST: dict[str, type] = dict.fromkeys('has_issues has_projects has_wiki has_discussions is_template web_commit_signoff_required allow_forking'.split(), bool)
+GRAPHQL: dict[str, type] = dict.fromkeys('mergeCommitAllowed squashMergeAllowed rebaseMergeAllowed autoMergeAllowed allowUpdateBranch deleteBranchOnMerge hasSponsorshipsEnabled'.split(), bool)
 GRAPHQL.update({k: str for k in 'squashMergeCommitTitle squashMergeCommitMessage mergeCommitTitle mergeCommitMessage issueCreationPolicy pullRequestCreationPolicy'.split()})
 ENUMS = {'squashMergeCommitTitle': ['PR_TITLE','COMMIT_OR_PR_TITLE'], 'squashMergeCommitMessage': ['PR_BODY','COMMIT_MESSAGES','BLANK'], 'mergeCommitTitle': ['PR_TITLE','MERGE_MESSAGE'], 'mergeCommitMessage': ['PR_BODY','PR_TITLE','BLANK'], 'issueCreationPolicy': ['ALL','COLLABORATORS_ONLY'], 'pullRequestCreationPolicy': ['ALL','COLLABORATORS_ONLY']}
 RULE_FIELDS = {'name':str,'target':str,'enforcement':str,'conditions':dict,'rules':list,'bypass_actors':list}
+REST['default_branch'] = str
 MISSING = object()
 
 class Unknown(Exception):
@@ -33,11 +35,11 @@ def validate(value, fields, path):
     if not isinstance(value, dict) or set(value) - set(fields):
         raise ValueError(path + ': expected object with supported fields ' + ', '.join(fields))
     for key, item in value.items():
-        if type(item) is not fields[key] or (key in ENUMS and item not in ENUMS[key]):
+        if type(item) is not fields[key] or (key in ENUMS and item not in ENUMS[key]) or (key == 'default_branch' and not item.strip()):
             raise ValueError(path + '.' + key + ': invalid value/type')
 
 
-def gh(host, *args, raw=False):
+def gh(host: str, *args: str, raw: bool = False) -> Any:
     try:
         proc = subprocess.run(['gh', *args], capture_output=True, text=True, timeout=60)
     except (OSError, subprocess.TimeoutExpired) as error:
@@ -55,7 +57,7 @@ def gh(host, *args, raw=False):
 
 
 def compare(wanted, actual, path, findings):
-    if actual is MISSING or actual is None:
+    if actual is MISSING or (actual is None and wanted is not None):
         findings.append({'path':path,'status':'unknown','expected':wanted})
     elif isinstance(wanted, dict):
         if not isinstance(actual, dict):
@@ -67,14 +69,28 @@ def compare(wanted, actual, path, findings):
         if not isinstance(actual, list):
             findings.append({'path':path,'status':'unknown','reason':'response shape'})
             return
-        remaining = list(actual)
+        # Maximum one-to-one projected matching for unordered multisets.
+        def matches(value, item):
+            probe = []
+            compare(value, item, path, probe)
+            return all(f['status'] == 'match' for f in probe)
+        edges = [[i for i, item in enumerate(actual) if matches(value, item)] for value in wanted]
+        assigned = {}
+        def assign(index, seen):
+            for candidate in edges[index]:
+                if candidate in seen:
+                    continue
+                seen.add(candidate)
+                if candidate not in assigned or assign(assigned[candidate], seen):
+                    assigned[candidate] = index
+                    return True
+            return False
         for index, value in enumerate(wanted):
-            keys = [k for k in ('type','context','actor_type','actor_id') if isinstance(value, dict) and k in value]
-            candidates = [i for i, item in enumerate(remaining) if (all(isinstance(item, dict) and item.get(k) == value[k] for k in keys) if keys else item == value)]
-            if len(candidates) == 1:
-                compare(value, remaining.pop(candidates[0]), f'{path}[{index}]', findings)
-            else:
-                findings.append({'path':f'{path}[{index}]','status':'drift','expected':value,'reason':'missing or ambiguous array entry'})
+            if not assign(index, set()):
+                findings.append({'path':f'{path}[{index}]','status':'drift','expected':value,'reason':'missing matching array entry'})
+        for candidate, index in sorted(assigned.items(), key=lambda entry: entry[1]):
+            compare(wanted[index], actual[candidate], f'{path}[{index}]', findings)
+        remaining = [item for index, item in enumerate(actual) if index not in assigned]
         if remaining:
             findings.append({'path':path,'status':'drift','actual_extra':remaining})
     else:
@@ -85,21 +101,29 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--host', required=True)
     parser.add_argument('--repo', required=True, help='literal OWNER/REPO')
-    parser.add_argument('--settings', required=True, help='JSON containing rest/graphql objects')
+    parser.add_argument('--settings', help='JSON containing rest/graphql objects')
     parser.add_argument('--ruleset', help='one ruleset JSON; match name + target')
     parser.add_argument('--compare-bypass', action='store_true', help='admin-visible only; never proves effective access')
+    parser.add_argument('--preflight', action='store_true', help='exact-target access evidence only; no declaration required')
+    parser.add_argument('--scope', choices=('ci','operator'), default='operator', help='ci excludes bypass comparison explicitly; operator remains conservative')
     args = parser.parse_args()
     findings = []
+    preflight = {'status':'not collected'}
+    collected = False
     try:
         if not re.fullmatch(r'[A-Za-z0-9]+(?:[.-][A-Za-z0-9]+)*', args.host) or not re.fullmatch(r'[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?/[A-Za-z0-9_.-]+', args.repo) or args.repo.split('/')[-1] in ('.','..'):
             raise ValueError('host/repo format invalid; use HOST and OWNER/REPO separately')
-        wanted = load(args.settings)
+        if not args.settings and not args.preflight:
+            raise ValueError('--settings required unless --preflight is selected')
+        if args.scope == 'ci' and args.compare_bypass:
+            raise ValueError('--compare-bypass is operator-only; CI exclusion cannot verify bypass')
+        wanted = {} if args.preflight else load(args.settings)
         validate(wanted, {'rest':dict,'graphql':dict}, 'settings')
-        if not wanted or not any(wanted.values()):
+        if not args.preflight and (not wanted or not any(wanted.values())):
             raise ValueError('settings must declare at least one supported field')
         for section, fields in [('rest', REST), ('graphql', GRAPHQL)]:
             validate(wanted.get(section, {}), fields, section)
-        rules = load(args.ruleset) if args.ruleset else None
+        rules = load(args.ruleset) if args.ruleset and not args.preflight else None
         if rules is not None:
             validate(rules, RULE_FIELDS, 'ruleset')
             if not rules.get('name') or rules.get('target') not in ('branch','tag'):
@@ -111,19 +135,28 @@ def main():
                 if not rule.get('type'):
                     raise ValueError('rule requires type')
             for actor in rules.get('bypass_actors', []):
-                validate(actor, {'actor_id':int,'actor_type':str,'bypass_mode':str}, 'bypass_actors')
+                if not isinstance(actor,dict) or set(actor) != {'actor_id','actor_type','bypass_mode'}:
+                    raise ValueError('bypass actor requires exactly actor_id, actor_type, bypass_mode')
+                if actor['actor_type'] not in ('OrganizationAdmin','RepositoryRole','Team','Integration','DeployKey') or actor['bypass_mode'] not in ('always','pull_request','exempt'):
+                    raise ValueError('unsupported bypass actor type/mode')
+                if not (actor['actor_type'] == 'OrganizationAdmin' and actor['actor_id'] is None) and (type(actor['actor_id']) is not int or actor['actor_id'] <= 0):
+                    raise ValueError('bypass actor_id must be a positive integer or null for OrganizationAdmin')
         gh(args.host, 'auth','status','--hostname',args.host, raw=True)
         view = gh(args.host,'repo','view',args.host+'/'+args.repo,'--json','nameWithOwner,defaultBranchRef')
         actual = gh(args.host,'api','--hostname',args.host,'--method','GET','repos/'+args.repo)
         if not isinstance(view,dict) or not isinstance(actual,dict) or view.get('nameWithOwner','').casefold() != args.repo.casefold() or actual.get('full_name','').casefold() != args.repo.casefold():
             raise Unknown('exact-target preflight identity mismatch; remote audit blocked')
+        preflight = {'status':'verified','nameWithOwner':view['nameWithOwner'],'defaultBranchRef':view.get('defaultBranchRef'),'full_name':actual['full_name']}
+        collected = not args.preflight
         compare(wanted.get('rest',{}),actual,'rest',findings)
         if wanted.get('graphql'):
             owner, name = args.repo.split('/')
             query = 'query($owner:String!,$name:String!){repository(owner:$owner,name:$name){'+' '.join(wanted['graphql'])+'}}'
             try:
                 response = gh(args.host,'api','--hostname',args.host,'graphql','-f','query='+query,'-f','owner='+owner,'-f','name='+name)
-                data = response.get('data') or {}
+                if not isinstance(response,dict) or not isinstance(response.get('data'),dict):
+                    raise Unknown('invalid GraphQL response shape')
+                data = response['data']
                 compare(wanted['graphql'],data.get('repository'), 'graphql',findings)
                 if response.get('errors'):
                     findings.append({'path':'graphql','status':'unknown','reason':'GraphQL errors; check schema/permissions'})
@@ -142,7 +175,7 @@ def main():
                     selected = dict(rules)
                     if 'bypass_actors' in selected and not args.compare_bypass:
                         selected.pop('bypass_actors')
-                        findings.append({'path':'ruleset.bypass_actors','status':'unknown','reason':'comparison opt-in requires independently verified admin visibility'})
+                        findings.append({'path':'ruleset.bypass_actors','status':'excluded' if args.scope == 'ci' else 'unknown','reason':'EXCLUDED from CI comparison; UNVERIFIED admin policy' if args.scope == 'ci' else 'comparison opt-in requires independently verified admin visibility'})
                     compare(selected,detail,'ruleset',findings)
             except (Unknown, KeyError, TypeError) as error:
                 findings.append({'path':'ruleset','status':'unknown','reason':str(error) if isinstance(error,Unknown) else 'invalid ruleset API response'})
@@ -154,7 +187,14 @@ def main():
     except (Unknown, TypeError, AttributeError) as error:
         status, code = 'unknown', 3
         findings.append({'path':'collection','status':status,'reason':str(error) if isinstance(error,Unknown) else 'invalid API response shape'})
-    print(json.dumps({'host':args.host,'repo':args.repo,'status':status,'coverage':{'ruleset':'selected; declaration comparison only, not effective enforcement' if args.ruleset else 'not_requested; no protection compliance claim','bypass':'opt-in; admin-visible declared actors only' if args.compare_bypass else 'not compared; CI visibility not guaranteed','identity':'current gh credential; operator and CI coverage differ'},'findings':findings}))
+    coverage = {
+        'settings':'collected; declared fields only' if collected else 'not collected; preflight only' if args.preflight and preflight['status'] == 'verified' else 'not collected',
+        'ruleset':'selected; declaration comparison only, not effective enforcement' if collected and args.ruleset else 'not collected; no protection compliance claim',
+        'bypass':'EXCLUDED from CI; UNVERIFIED; authoritative desired policy unchanged' if args.scope == 'ci' else 'opt-in; admin-visible declared actors only' if args.compare_bypass else 'not compared; admin visibility not guaranteed',
+        'full_policy_verified':False,
+        'identity':'current gh credential; operator and CI coverage differ',
+    }
+    print(json.dumps({'host':args.host,'repo':args.repo,'scope':args.scope,'status':status,'preflight':preflight,'coverage':coverage,'findings':findings}))
     if code:
         print(f'{status}: inspect JSON findings; correct declarations/access or approve drift remediation. No changes applied.',file=sys.stderr)
     return code
